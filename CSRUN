@@ -1,0 +1,233 @@
+#!/bin/bash
+# CSRUN — Simple C# runner with NuGet support (Mono-based)
+# Compiles and runs C# scripts, places the .exe next to the .cs file, cleans up .exe automatically
+# Requires sudo only for package installation
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+NUGET_EXE="$SCRIPT_DIR/nuget.exe"
+PKG_DIR="$SCRIPT_DIR/packages"
+
+# Download nuget.exe if missing
+if [ ! -f "$NUGET_EXE" ]; then
+    echo "Downloading nuget.exe..."
+    curl -L https://dist.nuget.org/win-x86-commandline/latest/nuget.exe -o "$NUGET_EXE"
+fi
+
+# Check arguments
+if [ $# -eq 0 ]; then
+    echo "Usage: CSRUN <file.cs> [args...]"
+    echo "       CSRUN -p <package>"
+    exit 1
+fi
+
+# Install NuGet package (requires sudo)
+if [ "$1" = "-p" ]; then
+    if [ -z "${2-}" ]; then
+        echo "Error: Package name required."
+        exit 1
+    fi
+
+    PKG_NAME="$2"
+    echo "Installing NuGet package: $PKG_NAME (requires sudo)..."
+
+    # Make sure package folder exists (under script dir)
+    sudo mkdir -p "$PKG_DIR"
+
+    # Install the package with sudo (use absolute path to nuget.exe)
+    sudo mono "$NUGET_EXE" install "$PKG_NAME" -OutputDirectory "$PKG_DIR" -NonInteractive | while read -r line; do
+        echo -n "."
+    done
+
+    echo ""
+    echo "Package $PKG_NAME installed in $PKG_DIR."
+    exit 0
+fi
+
+# Resolve source path robustly
+SRC="$1"
+
+# helper to get absolute path for the source
+if command -v realpath >/dev/null 2>&1; then
+    SRC_PATH="$(realpath "$SRC")"
+elif command -v readlink >/dev/null 2>&1 && readlink -f / >/dev/null 2>&1; then
+    SRC_PATH="$(readlink -f "$SRC")"
+else
+    # fallback: join with pwd if relative
+    if [[ "$SRC" = /* ]]; then
+        SRC_PATH="$SRC"
+    else
+        SRC_PATH="$(pwd)/$SRC"
+    fi
+fi
+
+if [ ! -f "$SRC_PATH" ]; then
+    echo "Error: Source file not found: $SRC_PATH"
+    exit 1
+fi
+
+SRC_DIR="$(dirname "$SRC_PATH")"
+BASENAME="$(basename "$SRC_PATH" .cs)"
+EXE_NAME="$BASENAME.exe"
+EXE_PATH="$SRC_DIR/$EXE_NAME"
+
+# Delete any old exe before compiling (the one next to the source)
+if [ -f "$EXE_PATH" ]; then
+    echo "Deleting old executable $EXE_PATH..."
+    rm -f "$EXE_PATH"
+fi
+
+# --- Build REFS_ARRAY from the DLLs NuGet put into $PKG_DIR ---
+# Strategy:
+# - For each package folder under $PKG_DIR, prefer a single framework folder in order PREF
+# - Add only one DLL of each assembly name (avoid duplicates)
+# - Try to locate netstandard facade and add it as well (needed for netstandard libs)
+
+REFS_ARRAY=()
+ADDED_ASM_LIST=()
+
+# check if an assembly basename is already added
+asm_added() {
+    local needle="$1"
+    for e in "${ADDED_ASM_LIST[@]:-}"; do
+        if [ "$e" = "$needle" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Preferred framework order (adjust if your Mono targets differ)
+PREF=( "net45" "net472" "netstandard2.0" "netstandard2.1" "netstandard2.2" )
+
+if [ -d "$PKG_DIR" ]; then
+    # iterate top-level package folders (e.g. packages/CsvHelper.33.1.0)
+    while IFS= read -r -d '' pkgdir; do
+        [ -d "$pkgdir" ] || continue
+
+        found_any_for_pkg=0
+
+        for f in "${PREF[@]}"; do
+            libdir="$pkgdir/lib/$f"
+            if [ -d "$libdir" ]; then
+                # add dlls under this framework folder (avoid duplicates by basename)
+                while IFS= read -r -d '' dll; do
+                    asm=$(basename "$dll")
+                    if ! asm_added "$asm"; then
+                        REFS_ARRAY+=("-r:$dll")
+                        ADDED_ASM_LIST+=("$asm")
+                    fi
+                done < <(find "$libdir" -maxdepth 1 -type f -name '*.dll' -print0 2>/dev/null)
+                found_any_for_pkg=1
+                break
+            fi
+        done
+
+        # fallback: if no preferred folder matched, add any dlls under lib/*
+        if [ "$found_any_for_pkg" -eq 0 ]; then
+            if [ -d "$pkgdir/lib" ]; then
+                while IFS= read -r -d '' dll; do
+                    asm=$(basename "$dll")
+                    if ! asm_added "$asm"; then
+                        REFS_ARRAY+=("-r:$dll")
+                        ADDED_ASM_LIST+=("$asm")
+                    fi
+                done < <(find "$pkgdir/lib" -type f -name '*.dll' -print0 2>/dev/null)
+            fi
+        fi
+    done < <(find "$PKG_DIR" -mindepth 1 -maxdepth 2 -type d -print0)
+fi
+
+# Try to find a netstandard facade on the host and add it (mcs needs this when referencing netstandard libs)
+NETSTD_CANDIDATES=(
+  "/usr/lib/mono/4.5/Facades/netstandard.dll"
+  "/usr/lib/mono/4.5/netstandard.dll"
+  "/usr/local/lib/mono/4.5/Facades/netstandard.dll"
+  "/usr/local/lib/mono/4.5/netstandard.dll"
+  "/usr/lib/mono/xbuild-frameworks/.NETStandard/v2.0/Facades/netstandard.dll"
+)
+NETSTD_ADDED=0
+for p in "${NETSTD_CANDIDATES[@]}"; do
+    if [ -f "$p" ]; then
+        base=$(basename "$p")
+        if ! asm_added "$base"; then
+            REFS_ARRAY+=("-r:$p")
+            ADDED_ASM_LIST+=("$base")
+            NETSTD_ADDED=1
+        fi
+        break
+    fi
+done
+
+if [ "${#REFS_ARRAY[@]}" -eq 0 ]; then
+    echo "Note: No package DLLs found in $PKG_DIR. If you installed a package, ensure it exists under $PKG_DIR."
+else
+    echo "Using package DLL references from $PKG_DIR:"
+    for r in "${REFS_ARRAY[@]}"; do
+        echo "  $r"
+    done
+    if [ "$NETSTD_ADDED" -eq 0 ]; then
+        echo "Warning: netstandard facade not found in common locations; if compilation fails you may need to install mono-devel/mono-complete so netstandard.dll is available."
+    fi
+fi
+
+# --- Build MONO_PATH from the directories of the DLL references so runtime can locate them ---
+MONO_DIRS_LIST=()
+dir_added() {
+    local needle="$1"
+    for e in "${MONO_DIRS_LIST[@]:-}"; do
+        if [ "$e" = "$needle" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+for ref in "${REFS_ARRAY[@]:-}"; do
+    # ref looks like "-r:/path/to/some.dll"
+    path="${ref#-r:}"
+    dir=$(dirname "$path")
+    if [ -d "$dir" ] && ! dir_added "$dir"; then
+        MONO_DIRS_LIST+=("$dir")
+    fi
+done
+
+# join MONO_DIRS_LIST into colon-separated MONO_PATH
+if [ "${#MONO_DIRS_LIST[@]}" -gt 0 ]; then
+    MONO_PATH_JOINED="${MONO_DIRS_LIST[0]}"
+    i=1
+    while [ $i -lt "${#MONO_DIRS_LIST[@]}" ]; do
+        MONO_PATH_JOINED="$MONO_PATH_JOINED:${MONO_DIRS_LIST[$i]}"
+        i=$((i+1))
+    done
+    export MONO_PATH="$MONO_PATH_JOINED"
+    echo "MONO_PATH set to: $MONO_PATH"
+else
+    # leave MONO_PATH unchanged if nothing to add
+    MONO_PATH=""
+fi
+
+echo "Compiling $SRC_PATH -> $EXE_PATH ..."
+# Use array expansion so paths with spaces are handled
+mcs -out:"$EXE_PATH" "${REFS_ARRAY[@]:-}" "$SRC_PATH"
+if [ $? -ne 0 ]; then
+    echo "Compilation failed!"
+    exit 1
+fi
+
+echo "Running $EXE_NAME in directory $SRC_DIR ..."
+# Run from the source file's directory and with MONO_PATH exported so mono can resolve assemblies
+pushd "$SRC_DIR" >/dev/null
+
+# If MONO_PATH was set above, it is already exported in the environment for this process
+mono "./$EXE_NAME" "${@:2}"
+RET=$?
+popd >/dev/null
+
+# Delete the compiled exe after running
+if [ -f "$EXE_PATH" ]; then
+    rm -f "$EXE_PATH"
+    echo "$EXE_PATH deleted after execution."
+fi
+
+exit $RET
